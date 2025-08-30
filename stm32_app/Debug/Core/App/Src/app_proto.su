@@ -1,0 +1,5 @@
+../Drivers/CMSIS/Include/core_cm3.h:1762:34:__NVIC_SystemReset	4	static,ignoring_inline_asm
+../Core/App/Src/app_proto.c:16:12:read_exact	32	static
+../Core/App/Src/app_proto.c:22:13:send_ack	24	static
+../Core/App/Src/app_proto.c:23:13:send_nack	24	static
+../Core/App/Src/app_proto.c:25:6:uart_cmd_task	176	static

@@ -1,0 +1,57 @@
+/*
+ * uart.c
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+
+#include "uart.h"
+/* ===== UARTs ===== */
+void gpio_init_usart1(void){
+    /* PA9 TX, PA10 RX */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_USART1EN;
+    GPIOA->CRH &= ~((0xF) << ((9-8)*4));
+    GPIOA->CRH |=  (0xB) << ((9-8)*4); /* PA9 AF PP 50MHz */
+    GPIOA->CRH &= ~((0xF) << ((10-8)*4));
+    GPIOA->CRH |=  (0x4) << ((10-8)*4);/* PA10 input floating */
+}
+void uart1_init_115200(void){
+    gpio_init_usart1();
+    uint32_t pclk2=72000000UL, baud=115200UL;
+    uint32_t div=(pclk2 + (baud/2U))/baud;
+    USART1->BRR = div;
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+void uart1_write(const void *buf, size_t len){
+    const uint8_t *p=(const uint8_t*)buf;
+    for(size_t i=0;i<len;i++){
+        while(!(USART1->SR & USART_SR_TXE)){}
+        USART1->DR = p[i];
+    }
+    while(!(USART1->SR & USART_SR_TC)){}
+}
+
+void gpio_init_usart2(void){
+    /* PA2 TX, PA3 RX */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+    GPIOA->CRL &= ~((0xF)<<(2*4));
+    GPIOA->CRL |=  (0xB)<<(2*4); /* PA2 AF PP 50MHz */
+    GPIOA->CRL &= ~((0xF)<<(3*4));
+    GPIOA->CRL |=  (0x4)<<(3*4); /* PA3 input floating */
+}
+void uart2_init_115200(void){
+    gpio_init_usart2();
+    uint32_t pclk1=36000000UL, baud=115200UL;
+    uint32_t div=(pclk1 + (baud/2U))/baud;
+    USART2->BRR = div;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+void uart2_write(const char *s){
+    while(*s){
+        while(!(USART2->SR & USART_SR_TXE)){}
+        USART2->DR = (uint16_t)(*s++);
+    }
+    while(!(USART2->SR & USART_SR_TC)){}
+}

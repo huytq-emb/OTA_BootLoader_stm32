@@ -1,0 +1,81 @@
+#include "boot.h"
+
+void flash_unlock(void){
+    if(FLASH->CR & FLASH_CR_LOCK){
+        FLASH->KEYR = 0x45670123U;
+        FLASH->KEYR = 0xCDEF89ABU;
+    }
+}
+void flash_lock(void){ FLASH->CR |= FLASH_CR_LOCK; }
+
+static int wait_bsyrdy(void){
+    while(FLASH->SR & FLASH_SR_BSY);
+    if(FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)) return -1;
+    return 0;
+}
+
+int flash_erase_page(uint32_t addr){
+    if(addr < FLASH_BASE_ADDR) return -1;
+    if(addr & 0x3FF) return -1; /* 1KB aligned */
+    FLASH->CR |= FLASH_CR_PER;
+    FLASH->AR  = addr;
+    FLASH->CR |= FLASH_CR_STRT;
+    if(wait_bsyrdy()<0){ FLASH->CR &= ~FLASH_CR_PER; return -1; }
+    FLASH->CR &= ~FLASH_CR_PER;
+    return 0;
+}
+
+int flash_program_halfword(uint32_t addr, uint16_t data){
+    if(addr & 1) return -1;
+    FLASH->CR |= FLASH_CR_PG;
+    *(volatile uint16_t*)addr = data;
+    if(wait_bsyrdy()<0){ FLASH->CR &= ~FLASH_CR_PG; return -1; }
+    FLASH->CR &= ~FLASH_CR_PG;
+    return 0;
+}
+
+int flash_program_buf(uint32_t addr, const uint8_t* buf, size_t len){
+    if(addr & 1) return -1;
+    for(size_t i=0;i<len;i+=2){
+        uint16_t hw = buf[i] | ((i+1<len?buf[i+1]:0xFF)<<8);
+        if(flash_program_halfword(addr+i, hw)<0) return -1;
+    }
+    return 0;
+}
+
+int flash_is_range_in_app(uint32_t addr, size_t len){
+    if(len==0) return 1;
+    uint32_t end = addr + len - 1;
+    if(addr < APP_BASE) return 0;
+    if(end > APP_LIMIT) return 0;
+    return 1;
+}
+
+/* ===== Metadata ===== */
+void meta_read(bl_meta_t* m){
+    const bl_meta_t* pm = (const bl_meta_t*)META_BASE;
+    *m = *pm;
+    if(m->magic != META_MAGIC){
+        m->magic = META_MAGIC;
+        m->version = 0;
+        m->flags = 0;
+        m->size = 0;
+        m->crc32 = 0;
+    }
+}
+
+int meta_write(const bl_meta_t* m){
+    flash_unlock();
+    if(flash_erase_page(META_BASE)<0){ flash_lock(); return -1; }
+    int rc = flash_program_buf(META_BASE, (const uint8_t*)m, sizeof(bl_meta_t));
+    flash_lock();
+    return rc;
+}
+
+int meta_set_flags(uint16_t set_mask, uint16_t clr_mask){
+    bl_meta_t m;
+    meta_read(&m);
+    m.flags |= set_mask;
+    m.flags &= ~clr_mask;
+    return meta_write(&m);
+}

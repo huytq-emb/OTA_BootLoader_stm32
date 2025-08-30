@@ -1,0 +1,18 @@
+22:48:35 **** Incremental Build of configuration Debug for project stm32_bootloader ****
+make -j12 all 
+arm-none-eabi-gcc "../Core/Src/boot.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F103xB -c -I../Core/Inc -I../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy -I../Drivers/STM32F1xx_HAL_Driver/Inc -I../Drivers/CMSIS/Device/ST/STM32F1xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/boot.d" -MT"Core/Src/boot.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Core/Src/boot.o"
+arm-none-eabi-gcc "../Core/Src/flash.c" -mcpu=cortex-m3 -std=gnu11 -g3 -DDEBUG -DUSE_HAL_DRIVER -DSTM32F103xB -c -I../Core/Inc -I../Drivers/STM32F1xx_HAL_Driver/Inc/Legacy -I../Drivers/STM32F1xx_HAL_Driver/Inc -I../Drivers/CMSIS/Device/ST/STM32F1xx/Include -I../Drivers/CMSIS/Include -O0 -ffunction-sections -fdata-sections -Wall -fstack-usage -fcyclomatic-complexity -MMD -MP -MF"Core/Src/flash.d" -MT"Core/Src/flash.o" --specs=nano.specs -mfloat-abi=soft -mthumb -o "Core/Src/flash.o"
+arm-none-eabi-gcc -o "stm32_bootloader.elf" @"objects.list"   -mcpu=cortex-m3 -T"D:\bootloaderF1_OS\stm32_bootloader\STM32F103C8TX_FLASH.ld" --specs=nosys.specs -Wl,-Map="stm32_bootloader.map" -Wl,--gc-sections -static --specs=nano.specs -mfloat-abi=soft -mthumb -Wl,--start-group -lc -lm -Wl,--end-group
+Finished building target: stm32_bootloader.elf
+ 
+arm-none-eabi-size  stm32_bootloader.elf 
+arm-none-eabi-objdump -h -S stm32_bootloader.elf  > "stm32_bootloader.list"
+   text	   data	    bss	    dec	    hex	filename
+   9392	     84	   3988	  13464	   3498	stm32_bootloader.elf
+Finished building: default.size.stdout
+ 
+Finished building: stm32_bootloader.list
+ 
+
+22:48:37 Build Finished. 0 errors, 0 warnings. (took 1s.738ms)
+

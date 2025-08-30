@@ -1,0 +1,66 @@
+/* flash.c : F1 flash erase/write helpers, IRQ masked during ops */
+#include "boot.h"
+
+static inline void flash_wait(void){
+    while(FLASH->SR & FLASH_SR_BSY) {}
+}
+
+int flash_unlock(void){
+    if(FLASH->CR & FLASH_CR_LOCK){
+        FLASH->KEYR = 0x45670123U;
+        FLASH->KEYR = 0xCDEF89ABU;
+        if(FLASH->CR & FLASH_CR_LOCK) return -1;
+    }
+    return 0;
+}
+
+void flash_lock(void){
+    FLASH->CR |= FLASH_CR_LOCK;
+}
+
+int flash_erase_page(uint32_t addr){
+    __disable_irq();
+    flash_wait();
+    FLASH->CR |= FLASH_CR_PER;
+    FLASH->AR = addr;
+    FLASH->CR |= FLASH_CR_STRT;
+    flash_wait();
+    FLASH->CR &= ~FLASH_CR_PER;
+    __enable_irq();
+    return (FLASH->SR & (FLASH_SR_PGERR|FLASH_SR_WRPRTERR)) ? -1 : 0;
+}
+
+int flash_erase_range(uint32_t addr, uint32_t bytes){
+    uint32_t end = addr + bytes;
+    addr &= ~(FLASH_PAGE_BYTES - 1U);
+    for(; addr < end; addr += FLASH_PAGE_BYTES){
+        if(flash_erase_page(addr)) return -1;
+    }
+    return 0;
+}
+
+int flash_write_buf(uint32_t addr, const uint8_t *data, uint32_t len){
+    /* F1 programs halfword (16-bit) at a time. Align handling: pad last byte. */
+    __disable_irq();
+    flash_wait();
+    FLASH->CR |= FLASH_CR_PG;
+
+    uint32_t i = 0;
+    while(i < len){
+        uint16_t hw;
+        if((i + 1) < len) hw = (uint16_t)(data[i] | (uint16_t)data[i+1]<<8);
+        else              hw = (uint16_t)(data[i] | 0xFF00u); /* pad 0xFF */
+        *(volatile uint16_t*)(addr) = hw;
+        flash_wait();
+        /* verify */
+        if(*(volatile uint16_t*)(addr) != hw){
+            FLASH->CR &= ~FLASH_CR_PG; __enable_irq(); return -1;
+        }
+        addr += 2;
+        i += 2;
+    }
+
+    FLASH->CR &= ~FLASH_CR_PG;
+    __enable_irq();
+    return 0;
+}

@@ -1,0 +1,65 @@
+/*
+ * meta.c
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+#include "meta.h"
+
+/* ===== Metadata helpers ===== */
+void meta_read(meta_t *m){
+    memcpy(m, (const void*)META_PAGE_ADDR, sizeof(*m));
+    if(m->magic != META_MAGIC){
+        memset(m, 0, sizeof(*m));
+        m->magic = META_MAGIC;
+    }
+}
+int meta_write(const meta_t *m){
+    meta_t tmp = *m;
+
+    /* === Disable IRQ để tránh ISR chạy khi FLASH đang busy === */
+    __disable_irq();
+
+    /* unlock */
+    if(FLASH->CR & FLASH_CR_LOCK){
+        FLASH->KEYR = 0x45670123U;
+        FLASH->KEYR = 0xCDEF89ABU;
+        if(FLASH->CR & FLASH_CR_LOCK){ __enable_irq(); return -1; }
+    }
+
+    /* erase page */
+    while(FLASH->SR & FLASH_SR_BSY){}               // wait idle
+    FLASH->CR |= FLASH_CR_PER;
+    FLASH->AR  = META_PAGE_ADDR;
+    FLASH->CR |= FLASH_CR_STRT;
+    while(FLASH->SR & FLASH_SR_BSY){}               // wait erase done
+    FLASH->CR &= ~FLASH_CR_PER;
+    if(FLASH->SR & (FLASH_SR_PGERR|FLASH_SR_WRPRTERR)){
+        __enable_irq();
+        return -1;
+    }
+
+    /* program halfwords */
+    FLASH->CR |= FLASH_CR_PG;
+    const uint16_t *p = (const uint16_t*)&tmp;
+    uint32_t addr = META_PAGE_ADDR;
+    for(size_t i=0;i<sizeof(tmp)/2;i++){
+        *(volatile uint16_t*)addr = p[i];
+        while(FLASH->SR & FLASH_SR_BSY){}           // wait program
+        if(*(volatile uint16_t*)addr != p[i]){
+            FLASH->CR &= ~FLASH_CR_PG;
+            FLASH->CR |= FLASH_CR_LOCK;
+            __enable_irq();
+            return -1;
+        }
+        addr += 2;
+    }
+    FLASH->CR &= ~FLASH_CR_PG;
+    FLASH->CR |= FLASH_CR_LOCK;
+
+    /* === Re-enable IRQ ngay sau khi xong FLASH === */
+    __enable_irq();
+
+    return 0;
+}
+

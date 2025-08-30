@@ -1,0 +1,16 @@
+../Drivers/CMSIS/Include/core_cm3.h:1511:22:__NVIC_EnableIRQ	16	static
+../Drivers/CMSIS/Include/core_cm3.h:1639:22:__NVIC_SetPriority	16	static
+../Core/Src/uart.c:16:6:SysTick_Handler	4	static
+../Core/Src/uart.c:20:24:millis	4	static
+../Core/Src/uart.c:23:6:USART1_IRQHandler	16	static
+../Core/Src/uart.c:40:13:uart_gpio_init	16	static
+../Core/Src/uart.c:67:13:uart1_setup	32	static
+../Core/Src/uart.c:88:13:uart3_setup	32	static
+../Core/Src/uart.c:99:6:uart_init	8	static
+../Core/Src/uart.c:110:6:uart1_write_byte	16	static
+../Core/Src/uart.c:115:6:uart1_write	24	static
+../Core/Src/uart.c:119:5:uart1_read_byte	24	static
+../Core/Src/uart.c:131:13:uart3_write_byte	16	static
+../Core/Src/uart.c:135:6:uart3_write_str	16	static
+../Core/Src/uart.c:141:6:log_printf	272	static
+../Core/Src/uart.c:152:6:delay_ms	24	static,ignoring_inline_asm

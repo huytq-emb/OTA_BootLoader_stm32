@@ -1,0 +1,55 @@
+#ifndef APP_H
+#define APP_H
+/*
+ * Application (FreeRTOS native API)
+ * - Tasks: blink, logger, uart_cmd, producer/consumer
+ * - UART1 <-> ESP32 (nhận lệnh 'B' => yêu cầu bootloader)
+ * - UART3 -> PC log
+ * - Không dùng CMSIS-OS; chỉ FreeRTOS.h, task.h, queue.h
+ */
+#include "stm32f1xx.h"
+#include <stdint.h>
+#include <stdarg.h>
+
+/* ===== Clocks ===== */
+#define SYS_CORE_CLOCK_HZ 72000000UL
+
+/* ===== GPIO: LED PC13 ===== */
+#define LED_PORT GPIOC
+#define LED_PIN  13
+
+/* ===== UARTs ===== */
+#define UART1_BAUD 115200U /* ESP32 link */
+#define UART3_BAUD 115200U /* PC log */
+
+/* ===== Boot Metadata (trùng bootloader) ===== */
+#define META_MAGIC      0x4D455441UL
+#define MF_BOOT_REQ     (1u<<0)
+#define MF_VALID        (1u<<1)
+#define MF_IN_PROGRESS  (1u<<2)
+
+#ifndef FLASH_64K
+  #define META_BASE   0x0801FC00UL
+#else
+  #define META_BASE   0x0800FC00UL
+#endif
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint32_t crc32;
+    uint32_t flags;
+} bl_meta_t;
+
+/* ===== UART helpers ===== */
+void uart_init(void);
+void uart1_write_str(const char* s);
+int  uart1_read_byte(uint8_t* out, uint32_t timeout_ms);
+void uart3_write_str(const char* s);
+void log_printf(const char* fmt, ...);
+
+/* ===== Metadata helper ===== */
+void meta_request_boot(void);
+
+#endif /* APP_H */

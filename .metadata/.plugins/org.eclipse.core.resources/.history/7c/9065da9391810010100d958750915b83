@@ -1,0 +1,42 @@
+#ifndef APP_H
+#define APP_H
+
+#include "stm32f10x.h"
+#include <stdint.h>
+#include <stddef.h>
+
+/* Version increments for each new app build */
+#define APP_VERSION_U16  1
+
+#define APP_BASE   0x08004000UL
+#define META_BASE  0x0801F800UL
+#define META_MAGIC 0x4154454DUL
+#define META_FLAG_VALID   (1u<<0)
+#define META_FLAG_PENDING (1u<<1)
+#define META_FLAG_BOOTREQ (1u<<2)
+
+typedef struct {
+    uint32_t magic;
+    uint16_t version;
+    uint16_t flags;
+    uint32_t size;
+    uint32_t crc32;
+    uint32_t rsv[5];
+} bl_meta_t;
+
+/* BSP */
+void bsp_gpio_init(void);
+void bsp_uart1_init(uint32_t baud); /* log */
+void bsp_uart2_init(uint32_t baud); /* service link */
+void uart1_write(const char* s);
+void uart1_printf(const char* fmt, ...);
+
+/* META ops (write boot_req) */
+void flash_unlock(void);
+void flash_lock(void);
+int  flash_erase_page(uint32_t addr);
+int  flash_program_buf(uint32_t addr, const uint8_t* buf, size_t len);
+void meta_read(bl_meta_t* m);
+int  meta_write(const bl_meta_t* m);
+
+#endif

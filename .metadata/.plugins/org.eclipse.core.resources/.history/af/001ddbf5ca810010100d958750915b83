@@ -1,0 +1,89 @@
+/*
+ * flash.c — Flash erase/program helpers for STM32F1 (halfword programming)
+ * - No malloc, blocking wait.
+ * - Caller ensures address range is valid.
+ */
+#include "boot.h"
+
+static inline void flash_wait(void) {
+    while (FLASH->SR & FLASH_SR_BSY) { }
+}
+
+void flash_unlock(void) {
+    if (FLASH->CR & FLASH_CR_LOCK) {
+        FLASH->KEYR = 0x45670123U;
+        FLASH->KEYR = 0xCDEF89ABU;
+    }
+}
+void flash_lock(void) {
+    FLASH->CR |= FLASH_CR_LOCK;
+}
+
+int flash_wait_busy(void) {
+    flash_wait();
+    if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)) {
+        /* clear errors */
+        FLASH->SR |= FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
+        return -1;
+    }
+    return 0;
+}
+
+int flash_erase_page(uint32_t page_addr) {
+    flash_wait();
+    FLASH->CR |= FLASH_CR_PER;
+    FLASH->AR  = page_addr;
+    FLASH->CR |= FLASH_CR_STRT;
+    flash_wait();
+    FLASH->CR &= ~FLASH_CR_PER;
+    if (FLASH->SR & FLASH_SR_EOP) FLASH->SR = FLASH_SR_EOP; /* clear EOP */
+    if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)) {
+        FLASH->SR |= FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
+        return -1;
+    }
+    return 0;
+}
+
+int flash_write_halfword(uint32_t addr, uint16_t half) {
+    flash_wait();
+    FLASH->CR |= FLASH_CR_PG;
+    *(__IO uint16_t*)addr = half;
+    flash_wait();
+    FLASH->CR &= ~FLASH_CR_PG;
+    if (FLASH->SR & FLASH_SR_EOP) FLASH->SR = FLASH_SR_EOP;
+    if (FLASH->SR & (FLASH_SR_PGERR | FLASH_SR_WRPRTERR)) {
+        FLASH->SR |= FLASH_SR_PGERR | FLASH_SR_WRPRTERR;
+        return -1;
+    }
+    /* verify */
+    if (*(__IO uint16_t*)addr != half) return -1;
+    return 0;
+}
+
+/* len có thể lẻ: byte cuối sẽ pad 0xFF vào high-byte của halfword */
+int flash_write(uint32_t addr, const uint8_t* data, uint32_t len) {
+    if (!within_app_region(addr, len ? len : 1)) return -1;
+    uint32_t i = 0;
+    while (i < len) {
+        uint16_t hw;
+        if (i + 1 < len) {
+            hw = (uint16_t)data[i] | ((uint16_t)data[i+1] << 8);
+        } else {
+            hw = (uint16_t)data[i] | ((uint16_t)0xFF << 8);
+        }
+        if (flash_write_halfword(addr + i, hw) != 0) return -1;
+        i += 2;
+    }
+    return 0;
+}
+
+/* Erase app region enough to fit 'bytes' (rounded up to page boundary). */
+int flash_erase_app_region(uint32_t bytes) {
+    if (bytes > APP_MAX_SIZE) return -1;
+    uint32_t start = APP_BASE;
+    uint32_t end   = APP_BASE + ((bytes + FLASH_PAGE_SIZE - 1U) / FLASH_PAGE_SIZE) * FLASH_PAGE_SIZE;
+    for (uint32_t a = start; a < end; a += FLASH_PAGE_SIZE) {
+        if (flash_erase_page(a) != 0) return -1;
+    }
+    return 0;
+}

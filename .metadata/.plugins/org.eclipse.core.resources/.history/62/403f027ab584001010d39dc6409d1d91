@@ -1,0 +1,138 @@
+#ifndef BOOT_H
+#define BOOT_H
+/*
+ * Bootloader public header (bare‑metal, no HAL)
+ * - Target: STM32F103C8T6 @72MHz
+ * - UART1 <-> ESP32 (protocol + ACK/NACK)
+ * - UART3 -> PC log console
+ * - Flash layout & metadata
+ *
+ * Vietnamese notes are included for clarity.
+ */
+
+#include "stm32f1xx.h"
+#include <stdint.h>
+#include <stdarg.h>
+
+/* ========= Build-time options ========= */
+// Uncomment to build for 64KB Flash devices (F103C8 64KB variant)
+// #define FLASH_64K
+
+/* ========= Clock params (must match system_stm32f1xx.c) ========= */
+#define SYS_CORE_CLOCK_HZ   72000000UL
+
+/* ========= Flash Map =========
+   Bootloader: 0x08000000 - 0x08003FFF (16KB)
+   Application:0x08004000 - 0x0801FBFF
+   Metadata   :0x0801FC00 - 0x0801FFFF (last 1KB page)
+
+   64KB variant:
+   Metadata   :0x0800FC00 - 0x0800FFFF
+*/
+#define FLASH_BASE_ADDR     (0x08000000UL)
+#define BOOT_BASE           (0x08000000UL)
+#define BOOT_SIZE           (16UL*1024UL)
+#define APP_BASE            (0x08004000UL)
+
+#ifndef FLASH_64K
+  #define FLASH_TOTAL_SIZE  (128UL*1024UL)
+  #define META_BASE         (0x0801FC00UL)
+#else
+  #define FLASH_TOTAL_SIZE  (64UL*1024UL)
+  #define META_BASE         (0x0800FC00UL)
+#endif
+
+// #define FLASH_PAGE_SIZE     (1024UL)
+#define APP_END             (FLASH_BASE_ADDR + FLASH_TOTAL_SIZE - FLASH_PAGE_SIZE - 1UL)
+#define APP_MAX_SIZE        (APP_END - APP_BASE + 1UL)
+
+/* ========= Metadata ========= */
+#define META_MAGIC          (0x4D455441UL) /* 'META' */
+#define MF_BOOT_REQ         (1u<<0)  /* App yêu cầu vào bootloader */
+#define MF_VALID            (1u<<1)  /* Ảnh app đã verify OK */
+#define MF_IN_PROGRESS      (1u<<2)  /* Đang update (giữa chừng) */
+#define MF_ROLLBACK         (1u<<3)  /* (tùy chọn) rollback yêu cầu */
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t size;
+    uint32_t crc32;
+    uint32_t flags;
+} bl_meta_t;
+
+/* ========= FW Header from ESP32 (FWUP) ========= */
+typedef struct __attribute__((packed)) {
+    uint8_t  tag[4];     /* "FWUP" */
+    uint16_t ver;        /* little-endian */
+    uint32_t size;       /* bytes */
+    uint32_t crc32;      /* CRC-32 of image */
+    uint32_t flags;      /* reserved/flags */
+} fwup_hdr_t;
+
+/* ========= UART Protocol ========= */
+enum {
+    STX = 0x55,
+    TYPE_H = 0x01, /* Header */
+    TYPE_D = 0x02, /* Data */
+    TYPE_E = 0x03, /* End  */
+    TYPE_Q = 0x10  /* Command */
+};
+enum {
+    CMD_INFO   = 1,
+    CMD_BOOT   = 2,
+    CMD_ERASE  = 3,
+    CMD_BEGIN  = 4,
+    CMD_VERIFY = 5,
+    CMD_RUN    = 6
+};
+#define ACK_BYTE   0xAA
+#define NACK_BYTE  0xEE
+
+/* ========= UART pins =========
+ * USART1: PA9 (TX1),  PA10 (RX1) -> ESP32
+ * USART3: PB10 (TX3), PB11 (RX3, optional) -> PC Log
+ */
+#define UART1_BAUD 115200U
+#define UART3_BAUD 115200U
+
+/* ========= API ========= */
+/* uart.c */
+void uart_init(void);
+void uart1_write_byte(uint8_t b);
+void uart1_write(const uint8_t* p, uint32_t n);
+int  uart1_read_byte(uint8_t* out, uint32_t timeout_ms); /* -1 timeout */
+void uart3_write_str(const char* s);
+void log_printf(const char* fmt, ...);
+
+/* crc32.c */
+uint32_t crc32_update(uint32_t crc, const void* data, uint32_t len);
+
+/* flash.c */
+void flash_unlock(void);
+void flash_lock(void);
+int  flash_wait_busy(void);
+int  flash_erase_page(uint32_t page_addr);
+int  flash_write_halfword(uint32_t addr, uint16_t half);
+int  flash_write(uint32_t addr, const uint8_t* data, uint32_t len); /* len can be odd: last byte padded with 0xFF */
+int  flash_erase_app_region(uint32_t bytes); /* erase [APP_BASE .. APP_BASE+bytes) rounded to pages */
+
+/* boot.c (state machine + metadata + jump) */
+void boot_main(void);
+
+/* utils in boot.c */
+void delay_ms(uint32_t ms);
+
+/* Expose metadata helpers (for CLI) */
+int  meta_read(bl_meta_t* m);
+int  meta_write(const bl_meta_t* m);
+void meta_load_defaults(bl_meta_t* m);
+
+/* ========= Safe region checks ========= */
+static inline int within_app_region(uint32_t addr, uint32_t len) {
+    if (addr < APP_BASE) return 0;
+    if ((addr + len - 1U) > APP_END) return 0;
+    return 1;
+}
+
+#endif /* BOOT_H */

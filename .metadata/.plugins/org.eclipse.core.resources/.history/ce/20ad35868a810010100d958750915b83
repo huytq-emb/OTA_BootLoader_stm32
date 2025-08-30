@@ -1,0 +1,18 @@
+/*
+ * meta.h
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+
+#ifndef INC_META_H_
+#define INC_META_H_
+
+#include <string.h>
+#include "stm32f103xb.h"
+#include "app.h"
+/* ===== Metadata helpers ===== */
+void meta_read(meta_t *m);
+int meta_write(const meta_t *m);
+
+#endif /* INC_META_H_ */

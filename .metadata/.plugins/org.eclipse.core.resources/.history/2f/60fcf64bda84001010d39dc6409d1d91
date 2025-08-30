@@ -1,0 +1,17 @@
+/*
+ * bsp_uart.h
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+
+#ifndef BSP_UART_H
+#define BSP_UART_H
+#include <stdint.h>
+void bsp_uart1_init(uint32_t baud);
+void bsp_uart2_init(uint32_t baud);
+int  uart2_read_line(char* buf, int maxlen, uint32_t timeout_ms);
+int  uart2_write(const uint8_t* p, int n);
+void uart1_write(const char* s);
+void uart1_printf(const char* fmt, ...);
+#endif

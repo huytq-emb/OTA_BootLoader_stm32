@@ -1,0 +1,5 @@
+../Core/Src/uart2_log.c:6:13:gpio_init_usart2_txrx	1
+../Core/Src/uart2_log.c:17:6:uart2_init_115200	1
+../Core/Src/uart2_log.c:30:6:log_putc	2
+../Core/Src/uart2_log.c:35:6:log_write	2
+../Core/Src/uart2_log.c:39:6:log_printf	4

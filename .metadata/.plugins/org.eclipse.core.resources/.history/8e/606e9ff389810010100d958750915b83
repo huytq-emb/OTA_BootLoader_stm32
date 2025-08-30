@@ -1,0 +1,112 @@
+#ifndef BOOT_H_
+#define BOOT_H_
+
+#include "stm32f103xb.h"
+#include <stdint.h>
+#include <stddef.h>
+
+/* ==== Memory Map (Blue Pill, 128KB Flash, 20KB RAM) ==== */
+#define FLASH_BASE_ADDR     0x08000000UL
+#define FLASH_TOTAL_BYTES   (128U * 1024U)
+#define FLASH_PAGE_BYTES    1024U
+
+#define BOOT_BASE           (FLASH_BASE_ADDR + 0x0000)
+#define BOOT_SIZE_BYTES     (12U * 1024U)            /* 0x3000 */
+#define APP_BASE            (FLASH_BASE_ADDR + 0x3000)
+#define META_PAGE_ADDR      (FLASH_BASE_ADDR + FLASH_TOTAL_BYTES - FLASH_PAGE_BYTES) /* 0x0801FC00 */
+#define APP_END_EXCL_META   (META_PAGE_ADDR)         /* app ends before metadata page */
+
+#define APP_MAX_BYTES       (APP_END_EXCL_META - APP_BASE) /* 0x1CC00 (117,760 B) */
+
+/* ==== UART mapping ==== */
+/* USART1 <-> ESP32 (PA9 TX, PA10 RX) @115200 8N1 */
+#define OTA_USART           USART1
+/* USART2 -> PC log (PA2 TX, PA3 RX) @115200 8N1 */
+#define LOG_USART           USART2
+
+/* ==== Protocol ==== */
+#define STX                 0x02
+#define FT_HDR              0x01
+#define FT_DATA             0x02
+#define FT_END              0x03
+#define ACK                 0x06
+#define NACK                0x15
+
+#define CHUNK_SIZE          512U
+#define FRAME_TIMEOUT_MS    500U
+#define MAX_RETRY           5
+
+/* FW header (.fw) layout (little-endian):
+ * "FWUP"(4) | ver(2) | size(4) | crc32(4) | flags(2)
+ */
+typedef struct __attribute__((packed)) {
+    char     magic[4];      /* 'F','W','U','P' */
+    uint16_t ver;
+    uint32_t size;
+    uint32_t crc32;
+    uint16_t flags;
+} fwup_header_t;
+
+/* Metadata placed in the last flash page (1KB) */
+#define META_MAGIC          0x4D455441u /* 'META' */
+#define META_FLAG_VALID     0x0001u     /* APP image verified OK */
+#define META_FLAG_BOOTREQ   0x0002u     /* request bootloader (from APP) */
+
+typedef struct {
+    uint32_t magic;
+    uint16_t ver;
+    uint16_t _rsv0;
+    uint32_t size;
+    uint32_t crc32;
+    uint32_t flags;       /* bit0: VALID, bit1: BOOTREQ */
+    uint32_t _rsv[247];   /* pad to 1024 bytes (1 page) */
+} meta_t;
+
+/* ==== Boot state ==== */
+typedef enum {
+    BS_IDLE = 0,
+    BS_RECV,
+    BS_VERIFY,
+    BS_ACTIVATE,
+    BS_JUMP
+} boot_state_t;
+
+/* ==== UART1 ring buffer ==== */
+#define UART1_RX_BUF_SZ     1024
+
+/* ==== Exports ==== */
+void systick_setup_1ms(void);
+uint32_t millis(void);
+void delay_ms(uint32_t ms);
+
+/* UART to ESP32 (USART1) */
+void uart1_init_115200(void);
+int  uart1_read_byte_timeout(uint8_t *b, uint32_t to_ms);
+void uart1_write_byte(uint8_t b);
+void uart1_write(const void *buf, size_t len);
+
+/* UART2 log */
+void uart2_init_115200(void);
+void log_putc(char c);
+void log_write(const char *s);
+void log_printf(const char *fmt, ...);
+
+/* Flash ops (mask IRQ during write/erase) */
+int  flash_unlock(void);
+void flash_lock(void);
+int  flash_erase_page(uint32_t addr);
+int  flash_erase_range(uint32_t addr, uint32_t bytes);
+int  flash_write_buf(uint32_t addr, const uint8_t *data, uint32_t len);
+
+/* CRC32 (poly 0xEDB88320) */
+uint32_t crc32_update(uint32_t crc, const uint8_t *data, size_t len);
+
+/* Metadata helpers */
+void meta_read(meta_t *m);
+int  meta_write(const meta_t *m);
+int  meta_clear_bootreq(void);
+
+/* Jump */
+void jump_to_app(uint32_t app_base);
+
+#endif /* BOOT_H_ */

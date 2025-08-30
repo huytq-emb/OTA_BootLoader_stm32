@@ -1,0 +1,216 @@
+/* main.c : Demo APP
+ * - Blink PC13 mỗi 500ms
+ * - In "APP vX.Y" qua UART2 (tùy chọn) và UART1 một dòng ngắn
+ * - Lắng nghe UART1 chuỗi "OTA_REQ\n" để set META_FLAG_BOOTREQ và NVIC_SystemReset()
+ */
+#include "app.h"
+#include <string.h>
+
+static void gpio_led_init(void){
+    /* PC13 output push-pull 2MHz (Blue Pill LED) */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    /* CNF=00 (GP push-pull), MODE=10 (2MHz) for PC13 */
+    GPIOC->CRH &= ~((uint32_t)0xF << ((13-8)*4));
+    GPIOC->CRH |=  ((uint32_t)0x2 << ((13-8)*4));
+}
+
+static void led_toggle(void){
+    GPIOC->ODR ^= (1U << 13);
+}
+
+/* ===== SysTick millis ===== */
+static volatile uint32_t g_ms=0;
+void SysTick_Handler(void){ g_ms++; }
+void systick_setup_1ms(void){
+    SysTick->LOAD = (72000000UL/1000UL) - 1UL;
+    SysTick->VAL  = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
+}
+uint32_t millis(void){ return g_ms; }
+void delay_ms(uint32_t ms){ uint32_t t=millis(); while((millis()-t)<ms){} }
+
+/* ===== UARTs ===== */
+static void gpio_init_usart1(void){
+    /* PA9 TX, PA10 RX */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_USART1EN;
+    GPIOA->CRH &= ~((0xF) << ((9-8)*4));
+    GPIOA->CRH |=  (0xB) << ((9-8)*4); /* PA9 AF PP 50MHz */
+    GPIOA->CRH &= ~((0xF) << ((10-8)*4));
+    GPIOA->CRH |=  (0x4) << ((10-8)*4);/* PA10 input floating */
+}
+void uart1_init_115200(void){
+    gpio_init_usart1();
+    uint32_t pclk2=72000000UL, baud=115200UL;
+    uint32_t div=(pclk2 + (baud/2U))/baud;
+    USART1->BRR = div;
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+int uart1_read_byte_timeout(uint8_t *b, uint32_t to_ms){
+    uint32_t t0=millis();
+    while((millis()-t0)<to_ms){
+        if(USART1->SR & USART_SR_RXNE){
+            *b = (uint8_t)USART1->DR;
+            return 1;
+        }
+    }
+    return 0;
+}
+void uart1_write(const void *buf, size_t len){
+    const uint8_t *p=(const uint8_t*)buf;
+    for(size_t i=0;i<len;i++){
+        while(!(USART1->SR & USART_SR_TXE)){}
+        USART1->DR = p[i];
+    }
+    while(!(USART1->SR & USART_SR_TC)){}
+}
+
+static void gpio_init_usart2(void){
+    /* PA2 TX, PA3 RX */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+    GPIOA->CRL &= ~((0xF)<<(2*4));
+    GPIOA->CRL |=  (0xB)<<(2*4); /* PA2 AF PP 50MHz */
+    GPIOA->CRL &= ~((0xF)<<(3*4));
+    GPIOA->CRL |=  (0x4)<<(3*4); /* PA3 input floating */
+}
+void uart2_init_115200(void){
+    gpio_init_usart2();
+    uint32_t pclk1=36000000UL, baud=115200UL;
+    uint32_t div=(pclk1 + (baud/2U))/baud;
+    USART2->BRR = div;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+void uart2_write(const char *s){
+    while(*s){
+        while(!(USART2->SR & USART_SR_TXE)){}
+        USART2->DR = (uint16_t)(*s++);
+    }
+    while(!(USART2->SR & USART_SR_TC)){}
+}
+
+/* ===== Metadata helpers ===== */
+void meta_read(meta_t *m){
+    memcpy(m, (const void*)META_PAGE_ADDR, sizeof(*m));
+    if(m->magic != META_MAGIC){
+        memset(m, 0, sizeof(*m));
+        m->magic = META_MAGIC;
+    }
+}
+int meta_write(const meta_t *m){
+    /* Minimal page program from app: unlock/erase/write the last page */
+    /* Reuse FLASH controller directly */
+    meta_t tmp = *m;
+
+    /* unlock */
+    if(FLASH->CR & FLASH_CR_LOCK){
+        FLASH->KEYR = 0x45670123U;
+        FLASH->KEYR = 0xCDEF89ABU;
+        if(FLASH->CR & FLASH_CR_LOCK) return -1;
+    }
+    /* erase page */
+    while(FLASH->SR & FLASH_SR_BSY){}
+    FLASH->CR |= FLASH_CR_PER;
+    FLASH->AR  = META_PAGE_ADDR;
+    FLASH->CR |= FLASH_CR_STRT;
+    while(FLASH->SR & FLASH_SR_BSY){}
+    FLASH->CR &= ~FLASH_CR_PER;
+    if(FLASH->SR & (FLASH_SR_PGERR|FLASH_SR_WRPRTERR)) return -1;
+
+    /* program halfwords */
+    FLASH->CR |= FLASH_CR_PG;
+    const uint16_t *p = (const uint16_t*)&tmp;
+    uint32_t addr = META_PAGE_ADDR;
+    for(size_t i=0;i<sizeof(tmp)/2;i++){
+        *(volatile uint16_t*)addr = p[i];
+        while(FLASH->SR & FLASH_SR_BSY){}
+        if(*(volatile uint16_t*)addr != p[i]){
+            FLASH->CR &= ~FLASH_CR_PG;
+            FLASH->CR |= FLASH_CR_LOCK;
+            return -1;
+        }
+        addr += 2;
+    }
+    FLASH->CR &= ~FLASH_CR_PG;
+    FLASH->CR |= FLASH_CR_LOCK;
+    return 0;
+}
+
+/* ===== Request bootloader ===== */
+void request_bootloader_and_reset(void){
+    meta_t m; meta_read(&m);
+    m.magic = META_MAGIC;
+    m.flags |= META_FLAG_BOOTREQ;
+    /* do not clear VALID in app; bootloader will clear BOOTREQ after entry */
+    meta_write(&m);
+    /* Small delay to ensure flash done */
+    for(volatile uint32_t i=0;i<100000;i++){}
+    NVIC_SystemReset();
+}
+
+/* ===== Minimal SystemInit (same as boot) ===== */
+void System_Init(void){
+    RCC->CR |= RCC_CR_HSEON;
+    while(!(RCC->CR & RCC_CR_HSERDY)){}
+    FLASH->ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY_2;
+    RCC->CFGR = (RCC_CFGR_PLLSRC | RCC_CFGR_PLLMULL9)
+              | (RCC_CFGR_HPRE_DIV1)
+              | (RCC_CFGR_PPRE1_DIV2)
+              | (RCC_CFGR_PPRE2_DIV1)
+              | (RCC_CFGR_ADCPRE_DIV6);
+    RCC->CR |= RCC_CR_PLLON;
+    while(!(RCC->CR & RCC_CR_PLLRDY)){}
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while(((RCC->CFGR>>2)&0x3)!=0x2){}
+}
+
+/* ===== main ===== */
+int main(void){
+    System_Init();
+
+    /* Very important: this APP is linked at 0x08003000 and has its own vector table.
+       On reset, the bootloader sets VTOR and MSP before jumping. If started by HW,
+       we set VTOR ourselves to be safe in standalone flashing. */
+    SCB->VTOR = APP_BASE;
+
+    __enable_irq();
+
+    systick_setup_1ms();
+    gpio_led_init();
+    uart1_init_115200();
+    uart2_init_115200();
+
+    const char *banner1 = "[APP v1.0] UART1 ready. Type OTA_REQ to update.\n";
+    uart1_write(banner1, strlen(banner1));
+    uart2_write("[APP v1.0] Started\n");
+
+    char cmd[16];
+    uint8_t b;
+    uint32_t last=0;
+    size_t idx=0;
+
+    for(;;){
+        if((millis()-last) >= 500){
+            last = millis();
+            led_toggle();
+            uart2_write("[APP] Tick 1\n");
+        }
+        if(uart1_read_byte_timeout(&b, 1)){
+            if(b == '\r') continue;
+            if(idx < sizeof(cmd)-1){
+                cmd[idx++] = (char)b;
+                cmd[idx] = 0;
+            }
+            if(b == '\n'){
+                if(strcmp(cmd, "OTA_REQ\n") == 0){
+                    uart1_write("Entering bootloader...\n", 24);
+                    uart2_write("[APP] OTA_REQ received -> reset to bootloader\n");
+                    request_bootloader_and_reset();
+                } else {
+                    uart1_write("Unknown cmd\n", 12);
+                }
+                idx = 0;
+                cmd[0]=0;
+            }
+        }
+    }
+}

@@ -1,0 +1,68 @@
+/*
+ * bsp_uart.c
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+#include "stm32f10x.h"
+#include "bsp_uart.h"
+#include <stdarg.h>
+#include <stdio.h>
+
+void bsp_uart1_init(uint32_t baud){
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_USART1EN | RCC_APB2ENR_AFIOEN;
+    /* PA9 AF PP, PA10 in floating */
+    GPIOA->CRH &= ~((0xF<<4)|(0xF<<8));
+    GPIOA->CRH |=  (0xB<<4) | (0x4<<8);
+    USART1->BRR = SystemCoreClock/baud;
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+void bsp_uart2_init(uint32_t baud){
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART2EN;
+    GPIOA->CRL &= ~((0xF<<8)|(0xF<<12));
+    GPIOA->CRL |=  (0xB<<8) | (0x4<<12);
+    USART2->BRR = (SystemCoreClock/2)/baud;
+    USART2->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_UE;
+}
+
+void uart1_write(const char* s){ while(*s){ while(!(USART1->SR & USART_SR_TXE)); USART1->DR = *s++; } }
+void uart1_printf(const char* fmt, ...){
+    char buf[256];
+    va_list ap; va_start(ap,fmt);
+    vsnprintf(buf,sizeof(buf),fmt,ap);
+    va_end(ap);
+    uart1_write(buf);
+}
+
+static uint32_t g_ms=0;
+void systick_init(void){
+    SysTick->LOAD = SystemCoreClock/1000 - 1;
+    SysTick->VAL = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
+}
+void SysTick_Handler(void){ g_ms++; }
+static inline uint32_t millis(void){ return g_ms; }
+
+int uart2_write(const uint8_t* p, int n){
+    for(int i=0;i<n;i++){ while(!(USART2->SR & USART_SR_TXE)); USART2->DR = p[i]; }
+    return n;
+}
+
+int uart2_read_line(char* buf, int maxlen, uint32_t timeout_ms){
+    int idx=0;
+    uint32_t t0 = millis();
+    while(millis()-t0 < timeout_ms){
+        if(USART2->SR & USART_SR_RXNE){
+            char c = (char)USART2->DR;
+            if(c=='\n' || c=='\r'){
+                buf[idx]=0; return idx;
+            }
+            if(idx<maxlen-1) buf[idx++]=c;
+        }
+    }
+    return -1;
+}
+
+

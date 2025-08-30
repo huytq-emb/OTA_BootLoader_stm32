@@ -1,0 +1,21 @@
+/*
+ * bsp_gpio.c
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+#include "stm32f103xb.h"
+#include "bsp_gpio.h"
+
+/* PC13 LED on Blue Pill */
+void led_init(void){
+    RCC->APB2ENR |= RCC_APB2ENR_IOPCEN;
+    /* PC13 output push-pull 2MHz */
+    GPIOC->CRH &= ~(0xF << ((13-8)*4));
+    GPIOC->CRH |=  (0x2 << ((13-8)*4));
+}
+void led_toggle(void){
+    GPIOC->ODR ^= (1<<13);
+}
+
+

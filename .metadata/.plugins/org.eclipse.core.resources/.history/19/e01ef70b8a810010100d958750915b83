@@ -1,0 +1,76 @@
+/*
+ * uart1_esp.c
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+
+/* uart1_esp.c : USART1 (PA9 TX, PA10 RX) with RX ISR + ring buffer */
+#include "boot.h"
+
+static volatile uint8_t rxbuf[UART1_RX_BUF_SZ];
+static volatile uint16_t rx_head=0, rx_tail=0;
+
+static void gpio_init_usart1_txrx(void){
+    /* PA9=TX, PA10=RX */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_USART1EN;
+
+    /* PA9: AF push-pull 50MHz */
+    GPIOA->CRH &= ~((0xF) << ((9-8)*4));
+    GPIOA->CRH |=  (0xB) << ((9-8)*4);
+    /* PA10: input floating */
+    GPIOA->CRH &= ~((0xF) << ((10-8)*4));
+    GPIOA->CRH |=  (0x4) << ((10-8)*4);
+}
+
+void uart1_init_115200(void){
+    gpio_init_usart1_txrx();
+
+    /* USART1 on APB2 = 72MHz */
+    uint32_t pclk2 = 72000000UL;
+    uint32_t baud  = 115200UL;
+    uint32_t usartdiv = (pclk2 + (baud/2U)) / baud;
+
+    USART1->BRR = usartdiv;
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE | USART_CR1_UE;
+
+    NVIC_SetPriority(USART1_IRQn, 2);
+    NVIC_EnableIRQ(USART1_IRQn);
+}
+
+void USART1_IRQHandler(void){
+    if(USART1->SR & USART_SR_RXNE){
+        uint8_t b = (uint8_t)USART1->DR;
+        uint16_t next = (uint16_t)((rx_head + 1U) % UART1_RX_BUF_SZ);
+        if(next != rx_tail){
+            rxbuf[rx_head] = b;
+            rx_head = next;
+        } /* else: overflow -> drop */
+    }
+}
+
+static int rb_get(uint8_t *b){
+    if(rx_head == rx_tail) return 0;
+    *b = rxbuf[rx_tail];
+    rx_tail = (uint16_t)((rx_tail + 1U) % UART1_RX_BUF_SZ);
+    return 1;
+}
+
+int uart1_read_byte_timeout(uint8_t *b, uint32_t to_ms){
+    uint32_t t0 = millis();
+    while((millis() - t0) < to_ms){
+        if(rb_get(b)) return 1;
+    }
+    return 0;
+}
+
+void uart1_write_byte(uint8_t b){
+    while(!(USART1->SR & USART_SR_TXE)) {}
+    USART1->DR = (uint16_t)b;
+}
+
+void uart1_write(const void *buf, size_t len){
+    const uint8_t *p = (const uint8_t*)buf;
+    for(size_t i=0;i<len;i++) uart1_write_byte(p[i]);
+}
+

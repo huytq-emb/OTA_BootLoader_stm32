@@ -1,0 +1,363 @@
+/*
+ * boot.c — Bootloader state machine:
+ *  - Startup: decide jump or stay
+ *  - UART framing recv: STX|TYPE|SEQ|LEN|PAYLOAD|CRC16
+ *  - Commands: INFO/ERASE/BEGIN/VERIFY/RUN
+ *  - Data path: receive FWUP header, erase, write chunks, verify CRC32, mark VALID
+ *  - Metadata stored at last page
+ */
+#include "boot.h"
+#include <string.h>
+#include <stdio.h>
+
+static void clock_init(void) {
+    /* Enable HSE */
+    RCC->CR |= RCC_CR_HSEON;
+    while (!(RCC->CR & RCC_CR_HSERDY)) { }
+
+    /* Flash wait states = 2, prefetch on */
+    FLASH->ACR |= FLASH_ACR_PRFTBE;
+    FLASH->ACR &= ~FLASH_ACR_LATENCY;
+    FLASH->ACR |= FLASH_ACR_LATENCY_2;
+
+    /* PLL: source HSE, mul x9 => 72MHz */
+    RCC->CFGR &= ~(RCC_CFGR_PLLSRC | RCC_CFGR_PLLXTPRE | RCC_CFGR_PLLMULL);
+    RCC->CFGR |= RCC_CFGR_PLLSRC;              /* HSE as PLL source */
+    RCC->CFGR |= RCC_CFGR_PLLMULL9;
+
+    /* APB prescalers: AHB=1, APB2=1, APB1=2 (36MHz) */
+    RCC->CFGR &= ~(RCC_CFGR_HPRE | RCC_CFGR_PPRE1 | RCC_CFGR_PPRE2);
+    RCC->CFGR |= (0<<4); /* AHB=1 */
+    RCC->CFGR |= RCC_CFGR_PPRE1_DIV2; /* APB1=36MHz */
+    RCC->CFGR |= (0<<11); /* APB2=1 */
+
+    /* Enable PLL */
+    RCC->CR |= RCC_CR_PLLON;
+    while (!(RCC->CR & RCC_CR_PLLRDY)) { }
+
+    /* Switch SYSCLK to PLL */
+    RCC->CFGR &= ~RCC_CFGR_SW;
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while ((RCC->CFGR & RCC_CFGR_SWS) != RCC_CFGR_SWS_PLL) { }
+}
+
+void System_Init(void) {
+    /* Reset RCC registers to defaults (optional minimal) */
+    RCC->CR |= RCC_CR_HSION;
+    RCC->CFGR = 0x00000000;
+    RCC->CR &= ~(RCC_CR_HSEON | RCC_CR_PLLON);
+    RCC->CIR = 0x00000000;
+
+    clock_init();
+    SystemCoreClock = 72000000UL;
+}
+/* ===== CRC16-CCITT (0x1021), init=0xFFFF ===== */
+static uint16_t crc16_ccitt(const uint8_t* data, uint32_t len) {
+    uint16_t crc = 0xFFFF;
+    for (uint32_t i=0;i<len;i++) {
+        crc ^= (uint16_t)data[i] << 8;
+        for (int b=0;b<8;b++) {
+            if (crc & 0x8000) crc = (crc << 1) ^ 0x1021;
+            else              crc = (crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* ===== Metadata ===== */
+void meta_load_defaults(bl_meta_t* m) {
+    memset(m, 0, sizeof(*m));
+    m->magic = META_MAGIC;
+    m->flags = 0;
+}
+int meta_read(bl_meta_t* m) {
+    memcpy(m, (void*)META_BASE, sizeof(*m));
+    if (m->magic != META_MAGIC) {
+        meta_load_defaults(m);
+        return -1;
+    }
+    return 0;
+}
+int meta_write(const bl_meta_t* m) {
+    flash_unlock();
+    if (flash_erase_page(META_BASE) != 0) { flash_lock(); return -1; }
+    int rc = flash_write(META_BASE, (const uint8_t*)m, sizeof(*m));
+    flash_lock();
+    return rc;
+}
+
+/* ===== Jump to app ===== */
+static void jump_to_app(void) {
+    uint32_t sp = *(__IO uint32_t*)(APP_BASE + 0);
+    uint32_t pc = *(__IO uint32_t*)(APP_BASE + 4);
+    if (sp < 0x20000000UL || sp > 0x20005000UL) return; /* basic sanity for 20KB SRAM */
+    /* Deinit SysTick & UARTs to be nice */
+    SysTick->CTRL = 0;
+    USART1->CR1 = 0; USART3->CR1 = 0;
+    /* Relocate vector table */
+    SCB->VTOR = APP_BASE;
+    __disable_irq();
+    __set_MSP(sp);
+    ((void(*)(void))pc)();
+}
+
+/* ===== UART frame RX helpers ===== */
+static int read_exact(uint8_t* buf, uint32_t len, uint32_t to_ms) {
+    for (uint32_t i=0;i<len;i++) {
+        if (uart1_read_byte(&buf[i], to_ms) < 0) return -1;
+    }
+    return 0;
+}
+static void send_ack(uint8_t seq) {
+    uint8_t a[2] = { ACK_BYTE, seq };
+    uart1_write(a, 2);
+}
+static void send_nack(uint8_t seq) {
+    uint8_t a[2] = { NACK_BYTE, seq };
+    uart1_write(a, 2);
+}
+
+/* ===== FW receive context ===== */
+static fwup_hdr_t g_hdr;
+static uint32_t   g_write_addr;
+static uint32_t   g_bytes_written;
+static uint32_t   g_running_crc;
+
+/* ===== Process one frame ===== */
+static int process_frame(void) {
+    uint8_t b;
+    /* find STX */
+    if (uart1_read_byte(&b, 1000) < 0) return 0; /* no frame -> idle */
+    if (b != STX) return 0; /* skip garbage */
+
+    uint8_t hdr[1+1+2]; /* TYPE, SEQ, LEN16 */
+    if (read_exact(hdr, sizeof(hdr), 50) < 0) return -1;
+    uint8_t type = hdr[0];
+    uint8_t seq  = hdr[1];
+    uint16_t len = (uint16_t)hdr[2] | ((uint16_t)hdr[3] << 8);
+
+    if (len > 1024) { send_nack(seq); return -1; } /* safeguard */
+
+    static uint8_t payload[1024];
+    if (len) {
+        if (read_exact(payload, len, 500) < 0) { send_nack(seq); return -1; }
+    }
+    uint8_t crcbuf[5+1024];
+    crcbuf[0] = STX;
+    crcbuf[1] = type;
+    crcbuf[2] = seq;
+    crcbuf[3] = (uint8_t)(len & 0xFF);
+    crcbuf[4] = (uint8_t)(len >> 8);
+    if (len) memcpy(&crcbuf[5], payload, len);
+
+    uint8_t c16lsb, c16msb;
+    if (read_exact(&c16lsb, 1, 50) < 0 || read_exact(&c16msb, 1, 50) < 0) { send_nack(seq); return -1; }
+    uint16_t rx_crc = (uint16_t)c16lsb | ((uint16_t)c16msb << 8);
+    uint16_t calc = crc16_ccitt(crcbuf, 5 + len);
+    if (rx_crc != calc) {
+        log_printf("[BL] CRC16 bad: rx=0x%04X calc=0x%04X\n", rx_crc, calc);
+        send_nack(seq);
+        return -1;
+    }
+
+    /* Valid frame -> handle by TYPE */
+    if (type == TYPE_Q) {
+        if (len != 1) { send_nack(seq); return -1; }
+        uint8_t cmd = payload[0];
+        switch (cmd) {
+            case CMD_INFO:
+                /* Just ACK, and print to PC */
+                log_printf("[BL] INFO: ver=%lu size=%lu crc=0x%08lX flags=0x%08lX\n",
+                           (unsigned long)g_hdr.ver, (unsigned long)g_hdr.size,
+                           (unsigned long)g_hdr.crc32, (unsigned long)0);
+                send_ack(seq);
+                break;
+            case CMD_ERASE:
+                flash_unlock();
+                if (flash_erase_app_region(APP_MAX_SIZE) != 0) {
+                    flash_lock(); send_nack(seq); break;
+                }
+                flash_lock();
+                log_printf("[BL] ERASE done\n");
+                send_ack(seq);
+                break;
+            case CMD_BEGIN:
+                g_write_addr    = APP_BASE;
+                g_bytes_written = 0;
+                g_running_crc   = 0;
+                /* mark IN_PROGRESS in metadata */
+                {
+                    bl_meta_t m; meta_read(&m);
+                    m.flags |= MF_IN_PROGRESS;
+                    meta_write(&m);
+                }
+                log_printf("[BL] BEGIN\n");
+                send_ack(seq);
+                break;
+            case CMD_VERIFY: {
+                /* compute CRC32 of [APP_BASE .. APP_BASE+g_hdr.size) */
+                uint32_t crc = 0;
+                uint8_t* p = (uint8_t*)APP_BASE;
+                for (uint32_t off = 0; off < g_hdr.size; ) {
+                    uint32_t chunk = (g_hdr.size - off);
+                    if (chunk > 512) chunk = 512;
+                    crc = crc32_update(crc, p + off, chunk);
+                    off += chunk;
+                }
+                log_printf("[BL] VERIFY calc=0x%08lX expect=0x%08lX\n", (unsigned long)crc, (unsigned long)g_hdr.crc32);
+                if (crc == g_hdr.crc32 && g_hdr.size > 0 && g_hdr.size <= APP_MAX_SIZE) {
+                    bl_meta_t m; meta_read(&m);
+                    m.magic   = META_MAGIC;
+                    m.version = g_hdr.ver;
+                    m.size    = g_hdr.size;
+                    m.crc32   = g_hdr.crc32;
+                    m.flags  |= MF_VALID;
+                    m.flags  &= ~(MF_IN_PROGRESS | MF_BOOT_REQ);
+                    meta_write(&m);
+                    log_printf("[BL] VERIFY OK. VALID set.\n");
+                    send_ack(seq);
+                } else {
+                    bl_meta_t m; meta_read(&m);
+                    m.flags &= ~MF_VALID;
+                    meta_write(&m);
+                    log_printf("[BL] VERIFY FAIL.\n");
+                    send_nack(seq);
+                }
+                } break;
+            case CMD_RUN: {
+                bl_meta_t m; meta_read(&m);
+                if (m.flags & MF_VALID) {
+                    send_ack(seq);
+                    log_printf("[BL] RUN APP...\n");
+                    delay_ms(10);
+                    jump_to_app();
+                } else {
+                    log_printf("[BL] RUN rejected (not VALID)\n");
+                    send_nack(seq);
+                }
+                } break;
+            default:
+                send_nack(seq);
+                break;
+        }
+        return 1;
+    } else if (type == TYPE_H) {
+        if (len != sizeof(fwup_hdr_t)) { send_nack(seq); return -1; }
+        memcpy(&g_hdr, payload, sizeof(g_hdr));
+        if (memcmp(g_hdr.tag, "FWUP", 4) != 0) { send_nack(seq); return -1; }
+        if (g_hdr.size == 0 || g_hdr.size > APP_MAX_SIZE) { send_nack(seq); return -1; }
+        /* Prepare: erase only needed region (rounded) */
+        flash_unlock();
+        if (flash_erase_app_region(g_hdr.size) != 0) { flash_lock(); send_nack(seq); return -1; }
+        flash_lock();
+        g_write_addr    = APP_BASE;
+        g_bytes_written = 0;
+        g_running_crc   = 0;
+        /* Mark IN_PROGRESS */
+        bl_meta_t m; meta_read(&m);
+        m.magic = META_MAGIC;
+        m.flags |= MF_IN_PROGRESS;
+        m.flags &= ~MF_VALID;
+        meta_write(&m);
+
+        log_printf("[BL] HEADER ver=%u size=%lu crc=0x%08lX\n", g_hdr.ver, (unsigned long)g_hdr.size, (unsigned long)g_hdr.crc32);
+        send_ack(seq);
+        return 1;
+    } else if (type == TYPE_D) {
+        if (g_bytes_written >= g_hdr.size) { send_nack(seq); return -1; }
+        /* Clamp to remaining size to keep CRC correct; extra bytes beyond size are ignored */
+        uint32_t to_write = len;
+        if (g_bytes_written + to_write > g_hdr.size) {
+            to_write = g_hdr.size - g_bytes_written;
+        }
+        /* Program flash */
+        flash_unlock();
+        if (flash_write(g_write_addr, payload, to_write) != 0) { flash_lock(); send_nack(seq); return -1; }
+        flash_lock();
+
+        /* Update CRC incrementally against received bytes (not padded halfword) */
+        g_running_crc = crc32_update(g_running_crc, payload, to_write);
+        g_write_addr += to_write;
+        g_bytes_written += to_write;
+
+        send_ack(seq);
+        return 1;
+    } else if (type == TYPE_E) {
+        log_printf("[BL] END received: bytes=%lu / %lu\n", (unsigned long)g_bytes_written, (unsigned long)g_hdr.size);
+        send_ack(seq);
+        return 1;
+    } else {
+        send_nack(seq);
+        return -1;
+    }
+}
+
+/* ===== Entry ===== */
+void boot_main(void) {
+    uart_init();
+    log_printf("[BOOT] STM32F103 Bootloader @%lu Hz\n", (unsigned long)SYS_CORE_CLOCK_HZ);
+
+    /* Decide boot or stay (fail-safe rules) */
+    bl_meta_t meta;
+    int have = (meta_read(&meta) == 0);
+    if (!have) meta_load_defaults(&meta);
+
+    int stay =
+        (!have) ||
+        (meta.flags & MF_BOOT_REQ) ||
+        (meta.flags & MF_IN_PROGRESS) ||
+        !(meta.flags & MF_VALID);
+
+    if (!stay) {
+        log_printf("[BOOT] Valid app & no request -> jump\n");
+        jump_to_app();
+        /* If returns, fallthrough to stay */
+    } else {
+        log_printf("[BOOT] Stay in bootloader (flags=0x%08lX)\n", (unsigned long)meta.flags);
+    }
+
+    /* Main loop: receive frames / minimal CLI on UART3 */
+    log_printf("[BOOT] Awaiting UART1 frames...\n");
+    for (;;) {
+        /* Process any incoming frame (non-blocking-ish) */
+        (void)process_frame();
+
+        /* Minimal CLI via UART3 RX (optional) */
+        if (USART3->SR & USART_SR_RXNE) {
+            uint8_t c = (uint8_t)USART3->DR;
+            if (c == 'i') {
+                bl_meta_t m; meta_read(&m);
+                log_printf("[CLI] info: ver=%lu size=%lu crc=0x%08lX flags=0x%08lX\n",
+                           (unsigned long)m.version, (unsigned long)m.size,
+                           (unsigned long)m.crc32, (unsigned long)m.flags);
+            } else if (c == 'e') {
+                flash_unlock();
+                (void)flash_erase_app_region(APP_MAX_SIZE);
+                flash_lock();
+                log_printf("[CLI] erase app region done\n");
+            } else if (c == 'v') {
+                uint32_t crc = 0;
+                for (uint32_t off=0; off<meta.size; ) {
+                    uint32_t chunk = meta.size - off; if (chunk > 512) chunk = 512;
+                    crc = crc32_update(crc, (uint8_t*)APP_BASE + off, chunk);
+                    off += chunk;
+                }
+                log_printf("[CLI] verify calc=0x%08lX expect=0x%08lX\n", (unsigned long)crc, (unsigned long)meta.crc32);
+            } else if (c == 'b') {
+                bl_meta_t m; meta_read(&m);
+                m.flags |= MF_BOOT_REQ;
+                meta_write(&m);
+                NVIC_SystemReset();
+            } else if (c == 'h') {
+                log_printf("CLI: i=info e=erase v=verify b=boot h=help\n");
+            }
+        }
+    }
+}
+
+/* ===== Reset Handler calls this ===== */
+int main(void) {
+    System_Init();
+    boot_main();
+    while (1) { }
+}

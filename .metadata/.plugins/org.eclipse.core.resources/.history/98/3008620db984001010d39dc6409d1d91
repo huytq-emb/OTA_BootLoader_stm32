@@ -1,0 +1,155 @@
+/*
+ * uart.c — USART1 (ESP32) with RX ring buffer + ISR
+ *          USART3 (PC log) simple blocking TX
+ * Bare-metal CMSIS (no HAL)
+ */
+#include "boot.h"
+#include <string.h>
+
+#define RB_SIZE 1024
+static volatile uint8_t rb[RB_SIZE];
+static volatile uint16_t rb_head = 0, rb_tail = 0;
+
+static volatile uint32_t g_tick_ms = 0;
+
+/* SysTick 1kHz for delay/timeouts */
+void SysTick_Handler(void) {
+    g_tick_ms++;
+}
+
+static inline uint32_t millis(void) { return g_tick_ms; }
+
+/* ===== USART1 IRQ: RX ring ===== */
+void USART1_IRQHandler(void) {
+    /* RXNE */
+    if (USART1->SR & USART_SR_RXNE) {
+        uint8_t d = (uint8_t)USART1->DR; /* read clears RXNE */
+        uint16_t next = (uint16_t)((rb_head + 1) % RB_SIZE);
+        if (next != rb_tail) {
+            rb[rb_head] = d;
+            rb_head = next;
+        } else {
+            /* overflow: drop byte */
+        }
+    }
+    /* ORE (Overrun) clear by reading SR then DR; already read DR above */
+    (void)USART1->SR;
+}
+
+/* ===== Low-level init pins/clocks ===== */
+static void uart_gpio_init(void) {
+    /* Enable clocks: GPIOA/B, AFIO, USART1 (APB2), USART3 (APB1) */
+    RCC->APB2ENR |= RCC_APB2ENR_IOPAEN | RCC_APB2ENR_IOPBEN | RCC_APB2ENR_AFIOEN | RCC_APB2ENR_USART1EN;
+    RCC->APB1ENR |= RCC_APB1ENR_USART3EN;
+
+    /* PA9: TX1 = AF PP 50MHz, PA10: RX1 = input floating */
+    /* CRH bits: pin9 (MODE9[1:0], CNF9[1:0]), pin10 (MODE10, CNF10) */
+    uint32_t crh = GPIOA->CRH;
+    /* PA9: MODE=11 (50MHz), CNF=10 (AF PP) */
+    crh &= ~((0xF) << ((9-8)*4));
+    crh |=  ((0xB) << ((9-8)*4));
+    /* PA10: MODE=00 (input), CNF=01 (floating input) */
+    crh &= ~((0xF) << ((10-8)*4));
+    crh |=  ((0x4) << ((10-8)*4));
+    GPIOA->CRH = crh;
+
+    /* PB10: TX3 AF PP 50MHz, PB11: RX3 input floating */
+    uint32_t crh_b = GPIOB->CRH; /* PB8..PB15, but PB10/11 are in CRH as well (pins 8..15) */
+    /* PB10: MODE=11, CNF=10 */
+    crh_b &= ~((0xF) << ((10-8)*4));
+    crh_b |=  ((0xB) << ((10-8)*4));
+    /* PB11: MODE=00, CNF=01 */
+    crh_b &= ~((0xF) << ((11-8)*4));
+    crh_b |=  ((0x4) << ((11-8)*4));
+    GPIOB->CRH = crh_b;
+}
+
+static void uart1_setup(uint32_t baud) {
+    /* APB2 for USART1 is 72MHz (HCLK), USARTDIV = Fpclk/(16*baud) */
+    USART1->CR1 = 0;
+    USART1->CR2 = 0;
+    USART1->CR3 = 0;
+
+    uint32_t pclk = SYS_CORE_CLOCK_HZ; /* APB2 = 72MHz by default config */
+    uint32_t usartdiv = (pclk + (baud/2U)) / baud; /* scaled by 16 later */
+    /* BRR encoding: mantissa in 12 bits, fraction in 4 bits: BRR = pclk/(16*baud) */
+    /* To avoid float: compute BRR directly */
+    uint32_t div_mantissa = pclk / (16U * baud);
+    uint32_t div_frac = ( (pclk % (16U * baud)) * 16U ) / (16U * baud);
+    USART1->BRR = (div_mantissa << 4) | (div_frac & 0xF);
+
+    USART1->CR1 = USART_CR1_TE | USART_CR1_RE | USART_CR1_RXNEIE;
+    USART1->CR1 |= USART_CR1_UE;
+
+    NVIC_SetPriority(USART1_IRQn, 5);
+    NVIC_EnableIRQ(USART1_IRQn);
+}
+
+static void uart3_setup(uint32_t baud) {
+    USART3->CR1 = 0; USART3->CR2 = 0; USART3->CR3 = 0;
+    /* APB1 for USART3 = 36MHz */
+    uint32_t pclk = SYS_CORE_CLOCK_HZ / 2U;
+    uint32_t div_mantissa = pclk / (16U * baud);
+    uint32_t div_frac = ( (pclk % (16U * baud)) * 16U ) / (16U * baud);
+    USART3->BRR = (div_mantissa << 4) | (div_frac & 0xF);
+    USART3->CR1 = USART_CR1_TE | USART_CR1_UE; /* TX only for logging */
+}
+
+/* ===== Public API ===== */
+void uart_init(void) {
+    uart_gpio_init();
+    /* SysTick 1kHz */
+    SysTick->LOAD  = (SYS_CORE_CLOCK_HZ / 1000U) - 1U;
+    SysTick->VAL   = 0;
+    SysTick->CTRL  = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
+
+    uart1_setup(UART1_BAUD);
+    uart3_setup(UART3_BAUD);
+}
+
+void uart1_write_byte(uint8_t b) {
+    while (!(USART1->SR & USART_SR_TXE)) { }
+    USART1->DR = b;
+}
+
+void uart1_write(const uint8_t* p, uint32_t n) {
+    for (uint32_t i=0;i<n;i++) uart1_write_byte(p[i]);
+}
+
+int uart1_read_byte(uint8_t* out, uint32_t timeout_ms) {
+    uint32_t t0 = millis();
+    while (rb_head == rb_tail) {
+        if ((millis() - t0) >= timeout_ms) return -1;
+    }
+    uint8_t d = rb[rb_tail];
+    rb_tail = (uint16_t)((rb_tail + 1) % RB_SIZE);
+    *out = d;
+    return 0;
+}
+
+/* ===== Logging to PC via USART3 ===== */
+static void uart3_write_byte(uint8_t b) {
+    while (!(USART3->SR & USART_SR_TXE)) { }
+    USART3->DR = b;
+}
+void uart3_write_str(const char* s) {
+    while (*s) uart3_write_byte((uint8_t)*s++);
+}
+
+/* Tiny printf using vsnprintf (newlib-nano recommended) */
+#include <stdio.h>
+void log_printf(const char* fmt, ...) {
+    char buf[256];
+    va_list ap; va_start(ap, fmt);
+    int n = vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    if (n < 0) return;
+    if (n > (int)sizeof(buf)) n = sizeof(buf);
+    uart3_write_str(buf);
+}
+
+/* export delay_ms for other modules */
+void delay_ms(uint32_t ms) {
+    uint32_t t0 = g_tick_ms;
+    while ((g_tick_ms - t0) < ms) { __NOP(); }
+}

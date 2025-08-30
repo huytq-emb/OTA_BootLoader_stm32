@@ -1,0 +1,5 @@
+../Drivers/CMSIS/Include/core_cm3.h:1762:34:__NVIC_SystemReset	1
+../Core/App/Src/app_proto.c:16:12:read_exact	3
+../Core/App/Src/app_proto.c:22:13:send_ack	1
+../Core/App/Src/app_proto.c:23:13:send_nack	1
+../Core/App/Src/app_proto.c:25:6:uart_cmd_task	17

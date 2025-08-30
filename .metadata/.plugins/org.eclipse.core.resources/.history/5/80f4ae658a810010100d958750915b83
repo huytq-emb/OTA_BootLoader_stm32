@@ -1,0 +1,91 @@
+#ifndef BOOT_H
+#define BOOT_H
+
+#include "stm32f10x.h"
+#include <stdint.h>
+#include <stddef.h>
+
+/* ===== Memory Map (fixed) ===== */
+#define FLASH_BASE_ADDR   0x08000000UL
+#define BOOT_BASE         0x08000000UL
+#define BOOT_SIZE         (16*1024UL)
+
+#define APP_BASE          0x08004000UL
+#define APP_LIMIT         0x0801F7FFUL   /* inclusive */
+#define APP_MAX_SIZE      (APP_LIMIT - APP_BASE + 1)
+
+#define META_BASE         0x0801F800UL   /* 1KB page */
+#define META_PAGE_SIZE    1024UL
+
+/* ===== UART ===== */
+void uart1_init(uint32_t baud); /* Log to PC */
+void uart2_init(uint32_t baud); /* Link to ESP32 */
+void uart1_putc(char c);
+void uart1_write(const char* s);
+void uart1_printf(const char* fmt, ...);
+
+int  uart2_getc_timeout(uint8_t* out, uint32_t timeout_ms);
+int  uart2_read_exact(uint8_t* buf, size_t len, uint32_t timeout_ms);
+int  uart2_write(const uint8_t* buf, size_t len);
+
+/* ===== Time ===== */
+void systick_init(void);
+uint32_t millis(void);
+
+/* ===== Flash ===== */
+void flash_unlock(void);
+void flash_lock(void);
+int  flash_erase_page(uint32_t addr); /* addr must be page-aligned (1KB) */
+int  flash_program_halfword(uint32_t addr, uint16_t data);
+int  flash_program_buf(uint32_t addr, const uint8_t* buf, size_t len); /* addr halfword aligned */
+int  flash_is_range_in_app(uint32_t addr, size_t len);
+
+/* ===== CRC ===== */
+uint32_t crc32_compute(const uint8_t* data, size_t len);
+uint32_t crc32_compute_flash(uint32_t addr, size_t len);
+uint16_t crc16_ccitt(const uint8_t* data, size_t len);
+
+/* ===== Metadata ===== */
+typedef struct {
+    uint32_t magic;     /* 0x4D455441 'META' */
+    uint16_t version;
+    uint16_t flags;     /* bit0: valid, bit1: pending, bit2: boot_req */
+    uint32_t size;
+    uint32_t crc32;
+    uint32_t rsv[5];
+} bl_meta_t;
+
+#define META_MAGIC 0x4154454DUL
+#define META_FLAG_VALID   (1u<<0)
+#define META_FLAG_PENDING (1u<<1)
+#define META_FLAG_BOOTREQ (1u<<2)
+
+void meta_read(bl_meta_t* m);
+int  meta_write(const bl_meta_t* m);
+int  meta_set_flags(uint16_t set_mask, uint16_t clr_mask);
+
+/* ===== Protocol ===== */
+#define PKT_HDR   0xA1
+#define PKT_DATA  0xA2
+#define PKT_END   0xA3
+#define RESP_ACK  0x79
+#define RESP_NAK  0x1F
+#define RESP_OK   0x90
+#define RESP_ERR  0xEE
+
+#define ERR_BAD_HDR   1
+#define ERR_SIZE_OOB  2
+#define ERR_CRC_CHUNK 3
+#define ERR_FLASH     4
+#define ERR_IMG_CRC   5
+
+/* ===== Boot logic ===== */
+void jump_to_app(uint32_t app_base);
+
+/* ===== Utils ===== */
+static inline void delay_ms(uint32_t ms){
+    uint32_t t = millis();
+    while((millis()-t) < ms) __NOP();
+}
+
+#endif

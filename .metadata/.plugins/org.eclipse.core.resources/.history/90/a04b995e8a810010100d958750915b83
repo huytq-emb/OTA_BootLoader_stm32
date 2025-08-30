@@ -1,0 +1,221 @@
+#include "boot.h"
+#include <string.h>
+
+/* Protocol helpers */
+static int send_byte(uint8_t b){ return uart2_write(&b,1)==1; }
+static int send_ack(void){ uint8_t b=RESP_ACK; return uart2_write(&b,1)==1; }
+static int send_nak(void){ uint8_t b=RESP_NAK; return uart2_write(&b,1)==1; }
+static int send_ok(void){ uint8_t b=RESP_OK; return uart2_write(&b,1)==1; }
+static int send_err(uint8_t reason){ uint8_t p[2]={RESP_ERR,reason}; return uart2_write(p,2)==2; }
+
+static int wait_hello_then_ready(uint32_t ms){
+    /* Wait for "HELLO" and reply "READY" */
+    const uint8_t target[5]={'H','E','L','L','O'};
+    uint8_t buf[5]={0}; size_t idx=0;
+    uint32_t deadline = millis() + ms;
+    while(millis() < deadline){
+        uint8_t b;
+        if(uart2_getc_timeout(&b, 1)){
+            buf[idx++] = b;
+            if(idx==5){
+                if(memcmp(buf,target,5)==0){
+                    uart2_write((const uint8_t*)"READY",5);
+                    return 1;
+                }
+                memmove(buf,buf+1,4);
+                idx=4;
+            }
+        }
+    }
+    return 0;
+}
+
+/* Boot decision */
+static int should_stay_in_boot(void){
+    bl_meta_t m; meta_read(&m);
+    /* boot_req flag */
+    if(m.flags & META_FLAG_BOOTREQ){ uart1_write("[BOOT] boot_req=1 -> stay\n"); return 1; }
+    /* Early “HELLO” detection within 1000 ms */
+    uart1_write("[BOOT] Wait HELLO 1s...\n");
+    if(wait_hello_then_ready(1000)){ uart1_write("[BOOT] HELLO detected -> stay\n"); return 1; }
+    /* else if valid app -> jump */
+    if(m.flags & META_FLAG_VALID){ uart1_write("[BOOT] Valid app & no request -> jump\n"); return 0; }
+    /* no valid app -> stay */
+    uart1_write("[BOOT] No valid app -> stay\n");
+    return 1;
+}
+
+/* Jump */
+typedef void (*pfn_void)(void);
+void jump_to_app(uint32_t app_base){
+    uart1_write("[BOOT] Jumping to app...\n");
+    __disable_irq();
+    /* Deinit UARTs, SysTick */
+    SysTick->CTRL = 0;
+    USART1->CR1 = 0; USART2->CR1 = 0;
+
+    uint32_t sp = *(volatile uint32_t*)app_base;
+    uint32_t rv = *(volatile uint32_t*)(app_base + 4);
+    SCB->VTOR = app_base;
+    __set_MSP(sp);
+    __enable_irq();
+    ((pfn_void)rv)();
+}
+
+/* Erase app region */
+static int erase_app_region(uint32_t size){
+    if(size > APP_MAX_SIZE) return -1;
+    uint32_t start = APP_BASE;
+    uint32_t end   = APP_BASE + ((size + 1023) & ~1023UL);
+    for(uint32_t a=start; a<end; a+=1024){
+        if(flash_erase_page(a)<0) return -1;
+    }
+    return 0;
+}
+
+static int program_app_stream(uint32_t offset_addr, const uint8_t* data, uint32_t len){
+    uint32_t addr = APP_BASE + offset_addr;
+    if(!flash_is_range_in_app(addr,len)) return -1;
+    if((addr & 1) || (len==0)) return -1;
+    return flash_program_buf(addr, data, len);
+}
+
+/* Process upload session */
+static int process_session(void){
+    /* Expect HDR packet */
+    uint8_t b=0;
+    if(!uart2_read_exact(&b,1,1000)) return send_err(ERR_BAD_HDR), -1;
+    if(b != PKT_HDR) return send_err(ERR_BAD_HDR), -1;
+
+    /* Read 16B header */
+    uint8_t h[16];
+    if(!uart2_read_exact(h,16,1000)) return send_err(ERR_BAD_HDR), -1;
+    if(h[0]!='F'||h[1]!='W'||h[2]!='U'||h[3]!='P'){ send_err(ERR_BAD_HDR); return -1; }
+    uint16_t ver = h[4] | (h[5]<<8);
+    uint32_t size = h[6] | (h[7]<<8) | (h[8]<<16) | (h[9]<<24);
+    uint32_t crc  = h[10] | (h[11]<<8) | (h[12]<<16) | (h[13]<<24);
+    uint16_t flags= h[14] | (h[15]<<8);
+
+    uart1_printf("[BOOT] HDR ver=%u size=%lu crc=0x%08lX flags=0x%04X\n",(unsigned)ver,(unsigned long)size,(unsigned long)crc,(unsigned)flags);
+
+    if(size==0 || size>APP_MAX_SIZE){ uart1_write("[BOOT] Size OOB\n"); send_err(ERR_SIZE_OOB); return -1; }
+
+    /* Send ACK for HDR */
+    send_ack();
+
+    /* Prepare flash */
+    flash_unlock();
+    uart1_write("[BOOT] Erase app region...\n");
+    if(erase_app_region(size)<0){ uart1_write("[ERR] Erase fail\n"); flash_lock(); send_err(ERR_FLASH); return -1; }
+    flash_lock();
+
+    /* Receive DATA chunks */
+    uint32_t offset=0;
+    uint16_t expected_seq=0;
+    uint8_t pkt;
+    uint32_t idle_deadline = millis() + 5000;
+
+    while(1){
+        if(millis()>idle_deadline){ uart1_write("[ERR] Idle timeout\n"); send_err(ERR_FLASH); return -1; }
+        if(!uart2_read_exact(&pkt,1,1000)) continue;
+        if(pkt==PKT_DATA){
+            idle_deadline = millis() + 5000;
+            uint8_t hdr[4];
+            if(!uart2_read_exact(hdr,4,1000)){ send_nak(); continue; }
+            uint16_t seq = hdr[0] | (hdr[1]<<8);
+            uint16_t len = hdr[2] | (hdr[3]<<8);
+            if(len==0 || len>256 || (len&1)){ uart1_write("[WARN] Bad len\n"); send_nak(); continue; }
+            uint8_t data[256];
+            if(!uart2_read_exact(data,len,1000)){ send_nak(); continue; }
+            uint8_t cbuf[2];
+            if(!uart2_read_exact(cbuf,2,1000)){ send_nak(); continue; }
+            uint16_t rxcrc = cbuf[0] | (cbuf[1]<<8);
+            uint16_t c = crc16_ccitt(&hdr[0],4);
+            c = crc16_ccitt(data,len) ^ (uint16_t)((c<<1) ^ (c>>1));
+            if(c != rxcrc){ uart1_write("[WARN] CRC16 mismatch\n"); send_nak(); continue; }
+            if(seq != expected_seq){ uart1_printf("[WARN] seq exp=%u got=%u\n", expected_seq, seq); send_nak(); continue; }
+
+            /* Program to flash */
+            flash_unlock();
+            if(program_app_stream(offset, data, len)<0){ flash_lock(); uart1_write("[ERR] Flash write\n"); send_err(ERR_FLASH); return -1; }
+            flash_lock();
+
+            offset += len;
+            expected_seq++;
+            send_ack();
+            if(offset >= size){
+                uart1_write("[BOOT] All data received\n");
+            }
+        } else if(pkt==PKT_END){
+            uart1_write("[BOOT] END received, verifying CRC32...\n");
+            uint32_t crc_calc = crc32_compute_flash(APP_BASE, size);
+            uart1_printf("[BOOT] CRC calc=0x%08lX need=0x%08lX\n",(unsigned long)crc_calc,(unsigned long)crc);
+            if(crc_calc != crc){ send_err(ERR_IMG_CRC); return -1; }
+
+            /* Update metadata: valid=1, boot_req=0, version/size/crc */
+            bl_meta_t m; meta_read(&m);
+            m.magic = META_MAGIC; m.version=ver; m.size=size; m.crc32=crc;
+            m.flags |= META_FLAG_VALID;
+            m.flags &= ~META_FLAG_BOOTREQ;
+            if(meta_write(&m)<0){ send_err(ERR_FLASH); return -1; }
+
+            send_ok();
+            uart1_write("[BOOT] Update OK -> jump app\n");
+            delay_ms(50);
+            jump_to_app(APP_BASE);
+            return 0;
+        } else {
+            /* unknown byte: ignore */
+        }
+    }
+}
+
+/* INFO command over UART2 & UART1 logs */
+static void service_info_query(void){
+    /* Very simple line-based parser on UART2 for "INFO\n" */
+    uint8_t b;
+    static char line[32]; static uint8_t idx=0;
+    if(uart2_getc_timeout(&b,1)){
+        if(b=='\n' || b=='\r'){
+            line[idx]=0; idx=0;
+            if(strcmp(line,"INFO")==0){
+                bl_meta_t m; meta_read(&m);
+                char msg[96];
+                snprintf(msg,sizeof(msg),"VER=%u SIZE=%lu CRC=0x%08lX FLAGS=0x%04X\n",
+                    (unsigned)m.version, (unsigned long)m.size, (unsigned long)m.crc32, (unsigned)m.flags);
+                uart2_write((uint8_t*)msg, strlen(msg));
+            }
+        }else if(idx<sizeof(line)-1){ line[idx++]=(char)b; }
+    }
+}
+
+int main(void){
+    SystemInit();
+    systick_init();
+    uart1_init(115200);
+    uart2_init(115200);
+
+    uart1_write("\n[BOOT] STM32F103 Bootloader\n");
+
+    if(!should_stay_in_boot()){
+        jump_to_app(APP_BASE);
+    }
+
+    /* If stay in boot: announce READY on HELLO if not yet */
+    uart1_write("[BOOT] Waiting session...\n");
+
+    uint32_t last_ready=0;
+    while(1){
+        /* If a HELLO arrives at any time, respond READY and process a session */
+        if(wait_hello_then_ready(100)){
+            process_session();
+        }
+        service_info_query();
+
+        /* Optional: periodic heartbeat on UART1 */
+        if(millis()-last_ready > 2000){
+            last_ready = millis();
+            uart1_write("[BOOT] idle\n");
+        }
+    }
+}

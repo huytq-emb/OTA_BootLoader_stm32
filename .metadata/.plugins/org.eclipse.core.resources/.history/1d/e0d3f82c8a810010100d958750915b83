@@ -1,0 +1,298 @@
+/*
+ * boot.c
+ *
+ *  Created on: Aug 25, 2025
+ *      Author: Truong Quoc Huy
+ */
+
+
+/* boot.c : Bootloader state machine IDLE→RECV→VERIFY→ACTIVATE→JUMP */
+#include "boot.h"
+#include <string.h>
+
+void System_Init(void){
+    /* Enable HSE */
+    RCC->CR |= RCC_CR_HSEON;
+    while(!(RCC->CR & RCC_CR_HSERDY)) {}
+
+    /* Flash latency 2WS */
+    FLASH->ACR = FLASH_ACR_PRFTBE | FLASH_ACR_LATENCY_2;
+
+    /* PLL: HSE x9 -> 72MHz */
+    RCC->CFGR = (RCC_CFGR_PLLSRC | RCC_CFGR_PLLMULL9)
+              | (RCC_CFGR_HPRE_DIV1)
+              | (RCC_CFGR_PPRE1_DIV2) /* APB1=36MHz */
+              | (RCC_CFGR_PPRE2_DIV1) /* APB2=72MHz */
+              | (RCC_CFGR_ADCPRE_DIV6);
+
+    RCC->CR |= RCC_CR_PLLON;
+    while(!(RCC->CR & RCC_CR_PLLRDY)) {}
+
+    /* Switch SYSCLK to PLL */
+    RCC->CFGR |= RCC_CFGR_SW_PLL;
+    while(((RCC->CFGR >> 2) & 0x3) != 0x2) {}
+}
+/* ===== SysTick millis ===== */
+static volatile uint32_t g_ms = 0;
+void SysTick_Handler(void){ g_ms++; }
+void systick_setup_1ms(void){
+    SysTick->LOAD = (72000000UL/1000UL) - 1UL;
+    SysTick->VAL  = 0;
+    SysTick->CTRL = SysTick_CTRL_CLKSOURCE_Msk | SysTick_CTRL_TICKINT_Msk | SysTick_CTRL_ENABLE_Msk;
+}
+uint32_t millis(void){ return g_ms; }
+void delay_ms(uint32_t ms){ uint32_t t = millis(); while((millis()-t) < ms){} }
+
+/* ===== CRC16-CCITT for frame (TYPE|LEN|PAYLOAD) ===== */
+static uint16_t crc16_ccitt(const uint8_t *data, size_t len){
+    uint16_t crc = 0xFFFF;
+    for(size_t i=0;i<len;i++){
+        crc ^= (uint16_t)data[i] << 8;
+        for(int j=0;j<8;j++){
+            if(crc & 0x8000) crc = (uint16_t)((crc << 1) ^ 0x1021);
+            else crc <<= 1;
+        }
+    }
+    return crc;
+}
+// CRC16-CCITT (FALSE) tích lũy: poly 0x1021, init tùy bạn truyền vào (thường 0xFFFF)
+static uint16_t crc16_accum(uint16_t crc, const uint8_t *data, size_t len){
+    for(size_t i = 0; i < len; i++){
+        crc ^= (uint16_t)data[i] << 8;
+        for(int j = 0; j < 8; j++){
+            if(crc & 0x8000) crc = (uint16_t)((crc << 1) ^ 0x1021);
+            else             crc = (uint16_t)(crc << 1);
+        }
+    }
+    return crc;
+}
+
+/* ===== Metadata helpers ===== */
+void meta_read(meta_t *m){
+    memcpy(m, (const void*)META_PAGE_ADDR, sizeof(meta_t));
+    if(m->magic != META_MAGIC){
+        memset(m, 0, sizeof(*m));
+        m->magic = META_MAGIC;
+    }
+}
+
+int meta_write(const meta_t *m){
+    meta_t tmp = *m;
+    if(flash_unlock()) return -1;
+    if(flash_erase_page(META_PAGE_ADDR)) { flash_lock(); return -1; }
+    int rc = flash_write_buf(META_PAGE_ADDR, (const uint8_t*)&tmp, sizeof(tmp));
+    flash_lock();
+    return rc;
+}
+
+int meta_clear_bootreq(void){
+    meta_t m; meta_read(&m);
+    m.flags &= ~META_FLAG_BOOTREQ;
+    return meta_write(&m);
+}
+
+/* ===== Jump to app ===== */
+typedef void (*entry_fn_t)(void);
+void jump_to_app(uint32_t app_base){
+    uint32_t const *vt = (uint32_t*)app_base;
+    uint32_t sp = vt[0];
+    uint32_t pc = vt[1];
+    /* basic sanity: SP in SRAM */
+    if(sp < 0x20000000UL || sp > (0x20000000UL + (20*1024UL))) return;
+
+    __disable_irq();
+    SysTick->CTRL = 0;
+    /* Deinit peripherals minimally */
+    USART1->CR1 = 0; USART2->CR1 = 0;
+
+    SCB->VTOR = app_base;
+    __set_MSP(sp);
+    entry_fn_t reset = (entry_fn_t)pc;
+    reset();
+}
+
+/* ===== Frame reader ===== */
+static int read_frame(uint8_t *type, uint8_t *payload, uint16_t *len){
+    uint8_t b = 0;
+    uint32_t t0 = millis();
+    /* seek STX */
+    while((millis()-t0) < FRAME_TIMEOUT_MS){
+        if(uart1_read_byte_timeout(&b, 1)){
+            if(b == STX) break;
+        }
+    }
+    if(b != STX) return -1;
+
+    uint8_t hdr[3]; /* TYPE + LEN(2) */
+    for(int i=0;i<3;i++){
+        if(!uart1_read_byte_timeout(&hdr[i], FRAME_TIMEOUT_MS)) return -1;
+    }
+    *type = hdr[0];
+    uint16_t L = (uint16_t)hdr[1] | ((uint16_t)hdr[2] << 8);
+    *len = L;
+    for(uint16_t i=0;i<L;i++){
+        if(!uart1_read_byte_timeout(&payload[i], FRAME_TIMEOUT_MS)) return -1;
+    }
+    uint8_t crc_lo, crc_hi;
+    if(!uart1_read_byte_timeout(&crc_lo, FRAME_TIMEOUT_MS)) return -1;
+    if(!uart1_read_byte_timeout(&crc_hi, FRAME_TIMEOUT_MS)) return -1;
+    uint16_t crc_rx = (uint16_t)crc_lo | ((uint16_t)crc_hi<<8);
+
+    /* verify CRC16 over hdr+payload (without STX) */
+    // thay đoạn verify CRC16 hiện tại:
+    uint16_t crc = 0xFFFF;
+    crc = crc16_accum(crc, hdr, 3);
+    if(L) crc = crc16_accum(crc, payload, L);
+    if(crc != crc_rx) return -2;
+
+    return 0;
+}
+
+/* ===== Main bootloader ===== */
+int main(void){
+    /* Clocks to 72MHz, GPIO, UARTs, SysTick */
+    System_Init();
+    systick_setup_1ms();
+    uart2_init_115200();
+    uart1_init_115200();
+
+    log_write("[BOOT] STM32F103 Bootloader\n");
+
+    /* If valid APP and no BOOTREQ -> jump */
+    meta_t meta; meta_read(&meta);
+    int app_valid = (meta.flags & META_FLAG_VALID) ? 1:0;
+    int boot_req  = (meta.flags & META_FLAG_BOOTREQ) ? 1:0;
+
+    if(app_valid && !boot_req){
+        log_write("[BOOT] Valid app & no request -> jump\n");
+        delay_ms(50);
+        jump_to_app(APP_BASE);
+    }else{
+        if(boot_req){
+            log_write("[BOOT] BOOTREQ set -> stay in bootloader\n");
+            meta_clear_bootreq();
+        }else{
+            log_write("[BOOT] No valid app -> stay in bootloader\n");
+        }
+    }
+
+    /* State vars */
+    boot_state_t st = BS_IDLE;
+    fwup_header_t hdr;
+    uint32_t expected = 0, received = 0;
+    uint32_t run_crc = 0;
+    uint32_t wr_addr = APP_BASE;
+
+    static uint8_t frame_buf[CHUNK_SIZE + 32];
+
+    for(;;){
+        if(st == BS_IDLE){
+            log_write("[BOOT] Waiting HDR...\n");
+            uint8_t type; uint16_t len;
+            int rc = read_frame(&type, frame_buf, &len);
+            if(rc == 0 && type == FT_HDR && len == sizeof(fwup_header_t)){
+                memcpy(&hdr, frame_buf, sizeof(hdr));
+                if(memcmp(hdr.magic,"FWUP",4)!=0){
+                    log_write("[BOOT] Bad header magic\n");
+                    uart1_write_byte(NACK);
+                    continue;
+                }
+                if(hdr.size == 0 || hdr.size > APP_MAX_BYTES){
+                    log_printf("[BOOT] Bad size %lu\n", (unsigned long)hdr.size);
+                    uart1_write_byte(NACK);
+                    continue;
+                }
+                /* Erase app region enough pages */
+                expected = hdr.size;
+                received = 0;
+                run_crc = 0;
+                wr_addr = APP_BASE;
+                if(flash_unlock()){ log_write("[BOOT] unlock fail\n"); uart1_write_byte(NACK); continue; }
+                uint32_t erase_bytes = (expected + FLASH_PAGE_BYTES - 1U) & ~(FLASH_PAGE_BYTES - 1U);
+                if(erase_bytes < (8*FLASH_PAGE_BYTES)) erase_bytes = (8*FLASH_PAGE_BYTES); /* erase a bit more */
+                if(APP_BASE + erase_bytes > APP_END_EXCL_META) erase_bytes = APP_END_EXCL_META - APP_BASE;
+                if(flash_erase_range(APP_BASE, erase_bytes)){ log_write("[BOOT] erase fail\n"); flash_lock(); uart1_write_byte(NACK); continue; }
+                flash_lock();
+
+                uart1_write_byte(ACK);
+                log_printf("[BOOT] HDR OK: ver=%u size=%lu crc32=0x%08lX\n",(unsigned)hdr.ver,(unsigned long)hdr.size,(unsigned long)hdr.crc32);
+                st = BS_RECV;
+            }else{
+                uart1_write_byte(NACK);
+            }
+        }
+        else if(st == BS_RECV){
+            uint8_t type; uint16_t len;
+            int rc = read_frame(&type, frame_buf, &len);
+            if(rc != 0){
+                uart1_write_byte(NACK);
+                continue;
+            }
+            if(type == FT_DATA){
+                if(len == 0 || len > CHUNK_SIZE){
+                    uart1_write_byte(NACK);
+                    continue;
+                }
+                /* write chunk to flash */
+                if(flash_unlock()){ uart1_write_byte(NACK); continue; }
+                if(flash_write_buf(wr_addr, frame_buf, len)){ flash_lock(); uart1_write_byte(NACK); continue; }
+                flash_lock();
+
+                wr_addr += len;
+                received += len;
+                run_crc = crc32_update(run_crc, frame_buf, len);
+
+                uart1_write_byte(ACK);
+                if(received >= expected){
+                    log_printf("[BOOT] All data received (%lu)\n",(unsigned long)received);
+                }
+            } else if(type == FT_END){
+                uart1_write_byte(ACK);
+                st = BS_VERIFY;
+            } else if(type == FT_HDR){
+                /* Unexpected new header -> reset session */
+                uart1_write_byte(NACK);
+                st = BS_IDLE;
+            } else {
+                uart1_write_byte(NACK);
+            }
+        }
+        else if(st == BS_VERIFY){
+            if(received != expected){
+                log_printf("[BOOT] Size mismatch: rx=%lu exp=%lu\n",(unsigned long)received,(unsigned long)expected);
+                st = BS_IDLE;
+                continue;
+            }
+            if(run_crc != hdr.crc32){
+                log_printf("[BOOT] CRC mismatch: calc=0x%08lX exp=0x%08lX\n",(unsigned long)run_crc,(unsigned long)hdr.crc32);
+                st = BS_IDLE;
+                continue;
+            }
+            log_write("[BOOT] VERIFY OK\n");
+            st = BS_ACTIVATE;
+        }
+        else if(st == BS_ACTIVATE){
+            /* Write metadata VALID + version/size/crc, clear BOOTREQ */
+            meta_t m; meta_read(&m);
+            m.magic = META_MAGIC;
+            m.ver   = hdr.ver;
+            m.size  = hdr.size;
+            m.crc32 = hdr.crc32;
+            m.flags &= ~META_FLAG_BOOTREQ;
+            m.flags |= META_FLAG_VALID;
+            if(meta_write(&m)){
+                log_write("[BOOT] meta write fail\n");
+                st = BS_IDLE;
+                continue;
+            }
+            log_write("[BOOT] Metadata updated, jumping to APP...\n");
+            st = BS_JUMP;
+        }
+        else if(st == BS_JUMP){
+            delay_ms(100);
+            jump_to_app(APP_BASE);
+            /* if jump returns (shouldn't) */
+            st = BS_IDLE;
+        }
+    }
+}
